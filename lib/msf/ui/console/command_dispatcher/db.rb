@@ -354,6 +354,8 @@ class Db
     end
   end
 
+  @@hosts_columns = [ 'address', 'mac', 'name', 'os_name', 'os_flavor', 'os_sp', 'purpose', 'info', 'comments']
+
   def cmd_hosts(*args)
     return unless active?
   ::ActiveRecord::Base.connection_pool.with_connection {
@@ -371,7 +373,7 @@ class Db
     default_columns << 'tags' # Special case
     virtual_columns = [ 'svcs', 'vulns', 'workspace', 'tags' ]
 
-    col_search = [ 'address', 'mac', 'name', 'os_name', 'os_flavor', 'os_sp', 'purpose', 'info', 'comments']
+    col_search = @@hosts_columns
 
     default_columns.delete_if {|v| (v[-2,2] == "id")}
     while (arg = args.shift)
@@ -380,7 +382,7 @@ class Db
         mode << :add
       when '-d','--delete'
         mode << :delete
-      when '-c'
+      when '-c','-C'
         list = args.shift
         if(!list)
           print_error("Invalid column list")
@@ -394,6 +396,10 @@ class Db
             return
           end
         }
+        if (arg == '-C')
+          @@hosts_columns = col_search
+        end
+ 
       when '-u','--up'
         onlyup = true
       when '-o'
@@ -426,6 +432,7 @@ class Db
         print_line "  -a,--add          Add the hosts instead of searching"
         print_line "  -d,--delete       Delete the hosts instead of searching"
         print_line "  -c <col1,col2>    Only show the given columns (see list below)"
+        print_line "  -C <col1,col2>    Only show the given columns until the next restart (see list below)"
         print_line "  -h,--help         Show this help information"
         print_line "  -u,--up           Only show hosts which are up"
         print_line "  -o <file>         Send output to a file in csv format"
@@ -479,7 +486,7 @@ class Db
         'SortIndex' => order_by
       })
 
-    # Sentinal value meaning all
+    # Sentinel value meaning all
     host_ranges.push(nil) if host_ranges.empty?
 
     case
@@ -717,7 +724,7 @@ class Db
         'SortIndex' => order_by
       })
 
-    # Sentinal value meaning all
+    # Sentinel value meaning all
     host_ranges.push(nil) if host_ranges.empty?
     ports = nil if ports.empty?
 
@@ -770,6 +777,7 @@ class Db
     print_line "Usage: vulns [addr range]"
     print_line
     print_line "  -h,--help             Show this help information"
+    print_line "  -o <file>             Send output to a file in csv format"
     print_line "  -p,--port <portspec>  List vulns matching this port spec"
     print_line "  -s <svc names>        List vulns matching these service names"
     print_line "  -R,--rhosts           Set RHOSTS from the results of the search"
@@ -794,6 +802,7 @@ class Db
     search_term = nil
     show_info   = false
     set_rhosts  = false
+    output_file = nil
 
     # Short-circuit help
     if args.delete "-h"
@@ -810,6 +819,14 @@ class Db
       when "-h","--help"
         cmd_vulns_help
         return
+      when "-o", "--output"
+        output_file = args.shift
+        if output_file
+          output_file = File.expand_path(output_file)
+        else
+          print_error("Invalid output filename")
+          return
+        end
       when "-p","--port"
         unless (arg_port_range(args.shift, port_ranges, true))
           return
@@ -839,6 +856,10 @@ class Db
     host_ranges.push(nil) if host_ranges.empty?
     ports = port_ranges.flatten.uniq
     svcs.flatten!
+    tbl = Rex::Text::Table.new(
+        'Header' => 'Vulnerabilities',
+        'Columns' => ['Timestamp', 'Host', 'Name', 'References', 'Information']
+      )
 
     each_host_range_chunk(host_ranges) do |host_search|
       framework.db.hosts(framework.db.workspace, false, host_search).each do |host|
@@ -850,25 +871,45 @@ class Db
             )
           end
           reflist = vuln.refs.map { |r| r.name }
+
           if(vuln.service)
             # Skip this one if the user specified a port and it
             # doesn't match.
             next unless ports.empty? or ports.include? vuln.service.port
             # Same for service names
             next unless svcs.empty? or svcs.include?(vuln.service.name)
-            print_status("Time: #{vuln.created_at} Vuln: host=#{host.address} name=#{vuln.name} refs=#{reflist.join(',')} #{(show_info && vuln.info) ? "info=#{vuln.info}" : ""}")
-
           else
             # This vuln has no service, so it can't match
             next unless ports.empty? and svcs.empty?
-            print_status("Time: #{vuln.created_at} Vuln: host=#{host.address} name=#{vuln.name} refs=#{reflist.join(',')} #{(show_info && vuln.info) ? "info=#{vuln.info}" : ""}")
           end
+
+          print_status("Time: #{vuln.created_at} Vuln: host=#{host.address} name=#{vuln.name} refs=#{reflist.join(',')} #{(show_info && vuln.info) ? "info=#{vuln.info}" : ""}")
+
+          if output_file
+            row = []
+            row << vuln.created_at
+            row << host.address
+            row << vuln.name
+            row << reflist * ","
+            if show_info && vuln.info
+              row << "info=#{vuln.info}"
+            else
+              row << ''
+            end
+            tbl << row
+          end
+
           if set_rhosts
             addr = (host.scope ? host.address + '%' + host.scope : host.address)
             rhosts << addr
           end
         end
       end
+    end
+
+    if output_file
+      File.write(output_file, tbl.to_csv)
+      print_status("Wrote vulnerability information to #{output_file}")
     end
 
     # Finally, handle the case where the user wants the resulting list
@@ -1115,7 +1156,7 @@ class Db
   def cmd_loot_help
     print_line "Usage: loot <options>"
     print_line " Info: loot [-h] [addr1 addr2 ...] [-t <type1,type2>]"
-    print_line "  Add: loot -f [fname] -i [info] -a [addr1 addr2 ...] [-t [type]"
+    print_line "  Add: loot -f [fname] -i [info] -a [addr1 addr2 ...] -t [type]"
     print_line "  Del: loot -d [addr1 addr2 ...]"
     print_line
     print_line "  -a,--add          Add loot to the list of addresses, instead of listing"
@@ -1187,34 +1228,38 @@ class Db
         'Columns' => [ 'host', 'service', 'type', 'name', 'content', 'info', 'path' ],
       })
 
-    # Sentinal value meaning all
+    # Sentinel value meaning all
     host_ranges.push(nil) if host_ranges.empty?
 
-  if mode == :add
-    if info.nil?
-      print_error("Info required")
-      return
-    end
-    if filename.nil?
-      print_error("Loot file required")
-      return
-    end
-    if types.nil? or types.size != 1
-      print_error("Exactly one loot type is required")
-      return
-    end
-    type = types.first
-    name = File.basename(filename)
-    host_ranges.each do |range|
-      range.each do |host|
-        file = File.open(filename, "rb")
-        contents = file.read
-        lootfile = framework.db.find_or_create_loot(:type => type, :host => host, :info => info, :data => contents, :path => filename, :name => name)
-        print_status("Added loot for #{host} (#{lootfile})")
+    if mode == :add
+      if host_ranges.compact.empty?
+        print_error('Address list required')
+        return
       end
+      if info.nil?
+        print_error("Info required")
+        return
+      end
+      if filename.nil?
+        print_error("Loot file required")
+        return
+      end
+      if types.nil? or types.size != 1
+        print_error("Exactly one loot type is required")
+        return
+      end
+      type = types.first
+      name = File.basename(filename)
+      file = File.open(filename, "rb")
+      contents = file.read
+      host_ranges.each do |range|
+        range.each do |host|
+          lootfile = framework.db.find_or_create_loot(:type => type, :host => host, :info => info, :data => contents, :path => filename, :name => name)
+          print_status("Added loot for #{host} (#{lootfile})")
+        end
+      end
+      return
     end
-    return
-  end
 
     each_host_range_chunk(host_ranges) do |host_search|
       framework.db.hosts(framework.db.workspace, false, host_search).each do |host|
@@ -1499,6 +1544,10 @@ class Db
   }
   end
 
+  def find_nmap_path
+    Rex::FileUtils.find_full_path("nmap") || Rex::FileUtils.find_full_path("nmap.exe")
+  end
+
   #
   # Import Nmap data from a file
   #
@@ -1524,11 +1573,8 @@ class Db
       end
     end
 
-    nmap =
-      Rex::FileUtils.find_full_path("nmap") ||
-      Rex::FileUtils.find_full_path("nmap.exe")
-
-    if (not nmap)
+    nmap = find_nmap_path
+    unless nmap
       print_error("The nmap executable could not be found")
       return
     end
@@ -1578,9 +1624,11 @@ class Db
   end
 
   def cmd_db_nmap_help
-    nmap =
-        Rex::FileUtils.find_full_path('nmap') ||
-        Rex::FileUtils.find_full_path('nmap.exe')
+    nmap = find_nmap_path
+    unless nmap
+      print_error("The nmap executable could not be found")
+      return
+    end
 
     stdout, stderr = Open3.capture3([nmap, 'nmap'], '--help')
 
@@ -1596,9 +1644,10 @@ class Db
   end
 
   def cmd_db_nmap_tabs(str, words)
-    nmap =
-        Rex::FileUtils.find_full_path('nmap') ||
-        Rex::FileUtils.find_full_path('nmap.exe')
+    nmap = find_nmap_path
+    unless nmap
+      return
+    end
 
     stdout, stderr = Open3.capture3([nmap, 'nmap'], '--help')
     tabs = []
@@ -1818,6 +1867,8 @@ class Db
     if (path)
       auth, dest = path.split('@')
       (dest = auth and auth = nil) if not dest
+      # remove optional scheme in database url
+      auth = auth.sub(/^\w+:\/\//, "") if auth
       res[:user],res[:pass] = auth.split(':') if auth
       targ,name = dest.split('/')
       (name = targ and targ = nil) if not name
